@@ -395,19 +395,15 @@ pub fn compute_singing_score(
     let stability_final = stability_score * qm;
     let expression_final = expression_score * qm;
 
-    // Weighted total → [40, 100] only for valid signals; invalid → [0, ~40]
+    // Weighted total [0, 100] — quality already applied per-dimension
     let total = pitch_final * 0.40
         + rhythm_final * 0.25
         + stability_final * 0.15
         + expression_final * 0.20;
 
-    // Floor of 40 only applies when the signal is valid singing
-    let total_mapped = if quality.is_valid {
-        40.0 + total * 0.6
-    } else {
-        // No floor — garbage input gets the raw (near-zero) weighted total
-        total
-    };
+    // Power curve: fast growth near 0, slow near 100. No floor.
+    //   raw  0 → 0,  25 → 40,  50 → 64,  75 → 82,  100 → 100
+    let total_mapped = (100.0 * (total / 100.0).powf(0.65)).clamp(0.0, 100.0);
 
     // Downsample pitch data for visualization
     let max_points = opts.max_pitch_points;
@@ -523,7 +519,7 @@ mod tests {
             voicing: vec![true; n],
         };
         let result = score_singing(&ref_f0, &user_f0, None, None);
-        // Valid singing input still gets floor of 40
+        // Valid singing with octave-invariant pitch → high score via power curve
         assert!(result.total_score >= 40.0, "total={}", result.total_score);
         assert!(result.total_score <= 100.0, "total={}", result.total_score);
         assert!(result.signal_quality.as_ref().unwrap().is_valid);
