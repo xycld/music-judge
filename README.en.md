@@ -1,16 +1,8 @@
 # music-judge
 
-Multi-dimensional singing scoring engine — pitch, rhythm, stability, and expression.
+Given reference and user vocal F0 (fundamental frequency) sequences, produces a composite score with per-phrase detail.
 
-## Features
-
-- **Pitch Score (40%)** — Octave-invariant chroma distance with adaptive perceptual tolerance (Zwicker & Fastl)
-- **Rhythm Score (25%)** — Windowed local tempo deviation analysis
-- **Stability Score (15%)** — Median variance, robust to note transitions
-- **Expression Score (20%)** — Detrended FFT spectral energy analysis
-- **Passaggio Detection** — Sliding-window standard deviation peak localization
-- **DTW Alignment** — Sakoe-Chiba constrained dynamic time warping with hierarchical support
-- **Attribute Feedback** — Vibrato, portamento, sustained note stability feedback generation
+Scoring covers four dimensions: pitch (40%), rhythm (25%), stability (15%), and expression (20%). It also detects the passaggio (vocal break point) and generates singing attribute feedback (vibrato, portamento, sustained note stability, etc.).
 
 ## Usage
 
