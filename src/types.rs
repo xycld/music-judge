@@ -50,6 +50,20 @@ pub struct PitchData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalQuality {
+    /// Fraction of frames marked as voiced (0..1)
+    pub voiced_ratio: f64,
+    /// Mean confidence across voiced frames (0..1)
+    pub mean_confidence: f64,
+    /// Pitch coherence: fraction of adjacent voiced frames within 200 cents (0..1)
+    pub pitch_coherence: f64,
+    /// Combined quality multiplier applied to raw scores (0..1)
+    pub quality_multiplier: f64,
+    /// Whether the signal passes the minimum quality threshold for scoring
+    pub is_valid: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoringResult {
     pub pitch_score: f64,
     pub rhythm_score: f64,
@@ -66,6 +80,8 @@ pub struct ScoringResult {
     pub feedback: Vec<FeedbackItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pitch_data: Option<PitchData>,
+    #[serde(default)]
+    pub signal_quality: Option<SignalQuality>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

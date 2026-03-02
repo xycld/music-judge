@@ -1,7 +1,7 @@
 use crate::dtw::{constrained_dtw, hierarchical_dtw};
 use crate::f0::hz_to_cent_default;
 use crate::feedback::generate_attribute_feedback;
-use crate::types::{F0Result, PitchData, ScoringOptions, ScoringResult};
+use crate::types::{F0Result, PitchData, ScoringOptions, ScoringResult, SignalQuality};
 use crate::utils::{mean, median, polyfit_3, polyval_3, rfft_magnitudes, std_dev, variance};
 
 /// Frequency-dependent perceptual tolerance (cents) based on Zwicker & Fastl.
@@ -155,8 +155,84 @@ fn detect_expression(
     score.clamp(0.0, 100.0)
 }
 
+/// Assess input signal quality from F0 data to detect noise, silence, or non-singing input.
+///
+/// Returns a `SignalQuality` with a `quality_multiplier` in [0, 1] that dampens scores
+/// for unreliable input. For genuine singing: voiced_ratio > 0.3, mean_confidence > 0.5,
+/// pitch_coherence > 0.4. Noise/silence fails on all three.
+pub fn assess_signal_quality(user_f0: &F0Result) -> SignalQuality {
+    let n = user_f0.frequencies.len();
+    if n == 0 {
+        return SignalQuality {
+            voiced_ratio: 0.0,
+            mean_confidence: 0.0,
+            pitch_coherence: 0.0,
+            quality_multiplier: 0.0,
+            is_valid: false,
+        };
+    }
+
+    // 1) Voiced ratio: what fraction of frames are voiced?
+    let n_voiced = user_f0.voicing.iter().filter(|&&v| v).count();
+    let voiced_ratio = n_voiced as f64 / n as f64;
+
+    // 2) Mean confidence of voiced frames
+    let voiced_confidences: Vec<f64> = user_f0
+        .confidences
+        .iter()
+        .zip(user_f0.voicing.iter())
+        .filter(|&(_, &v)| v)
+        .map(|(&c, _)| c)
+        .collect();
+    let mean_confidence = if voiced_confidences.is_empty() {
+        0.0
+    } else {
+        mean(&voiced_confidences)
+    };
+
+    // 3) Pitch coherence: fraction of consecutive voiced frames with |Δcent| < 200
+    //    Real singing has smooth pitch; noise has random jumps.
+    let voiced_freqs: Vec<f64> = user_f0
+        .frequencies
+        .iter()
+        .zip(user_f0.voicing.iter())
+        .filter(|&(_, &v)| v)
+        .map(|(&f, _)| f)
+        .collect();
+    let pitch_coherence = if voiced_freqs.len() < 2 {
+        0.0
+    } else {
+        let voiced_cents = hz_to_cent_default(&voiced_freqs);
+        let n_transitions = voiced_cents.len() - 1;
+        let n_smooth = voiced_cents
+            .windows(2)
+            .filter(|w| (w[1] - w[0]).abs() < 200.0)
+            .count();
+        n_smooth as f64 / n_transitions as f64
+    };
+
+    // Combined quality multiplier — each factor in [0, 1], multiplied together
+    // with individual sigmoid-like ramps so there's a smooth transition.
+    let vr_factor = ((voiced_ratio - 0.10) / 0.20).clamp(0.0, 1.0); // ramp 0.10→0.30
+    let mc_factor = ((mean_confidence - 0.20) / 0.30).clamp(0.0, 1.0); // ramp 0.20→0.50
+    let pc_factor = ((pitch_coherence - 0.20) / 0.30).clamp(0.0, 1.0); // ramp 0.20→0.50
+
+    let quality_multiplier = vr_factor * mc_factor * pc_factor;
+
+    // Binary gate: need at least voiced_ratio > 0.15 AND mean_confidence > 0.25
+    let is_valid = voiced_ratio > 0.15 && mean_confidence > 0.25;
+
+    SignalQuality {
+        voiced_ratio: (voiced_ratio * 1000.0).round() / 1000.0,
+        mean_confidence: (mean_confidence * 1000.0).round() / 1000.0,
+        pitch_coherence: (pitch_coherence * 1000.0).round() / 1000.0,
+        quality_multiplier: (quality_multiplier * 1000.0).round() / 1000.0,
+        is_valid,
+    }
+}
+
 /// Four dimensions: pitch (40%), rhythm (25%), stability (15%), expression (20%).
-/// Total score mapped to [40, 100].
+/// Total score mapped to [40, 100], then dampened by signal quality.
 pub fn compute_singing_score(
     ref_f0: &F0Result,
     user_f0: &F0Result,
@@ -308,12 +384,30 @@ pub fn compute_singing_score(
     // Expression Score (20%)
     let expression_score = detect_expression(user_f0, (4.0, 8.0), (20.0, 80.0), 0.01);
 
-    // Weighted total → [40, 100]
-    let total = pitch_score * 0.40
-        + rhythm_score * 0.25
-        + stability_score * 0.15
-        + expression_score * 0.20;
-    let total_mapped = 40.0 + total * 0.6;
+    // Signal quality gate — suppress scores for noise/silence/non-singing
+    let quality = assess_signal_quality(user_f0);
+    let qm = quality.quality_multiplier;
+
+    // Apply quality multiplier to each dimension.
+    // For invalid signals, scores collapse toward 0 instead of defaulting to 50.
+    let pitch_final = pitch_score * qm;
+    let rhythm_final = rhythm_score * qm;
+    let stability_final = stability_score * qm;
+    let expression_final = expression_score * qm;
+
+    // Weighted total → [40, 100] only for valid signals; invalid → [0, ~40]
+    let total = pitch_final * 0.40
+        + rhythm_final * 0.25
+        + stability_final * 0.15
+        + expression_final * 0.20;
+
+    // Floor of 40 only applies when the signal is valid singing
+    let total_mapped = if quality.is_valid {
+        40.0 + total * 0.6
+    } else {
+        // No floor — garbage input gets the raw (near-zero) weighted total
+        total
+    };
 
     // Downsample pitch data for visualization
     let max_points = opts.max_pitch_points;
@@ -329,13 +423,13 @@ pub fn compute_singing_score(
         (pitch_ref_cents, pitch_user_cents, pitch_timestamps, pitch_cent_diffs)
     };
 
-    let feedback = generate_attribute_feedback(user_f0, pitch_score, &phrase_results, 0.01);
+    let feedback = generate_attribute_feedback(user_f0, pitch_final, &phrase_results, 0.01);
 
     ScoringResult {
-        pitch_score: (pitch_score * 10.0).round() / 10.0,
-        rhythm_score: (rhythm_score * 10.0).round() / 10.0,
-        stability_score: (stability_score * 10.0).round() / 10.0,
-        expression_score: (expression_score * 10.0).round() / 10.0,
+        pitch_score: (pitch_final * 10.0).round() / 10.0,
+        rhythm_score: (rhythm_final * 10.0).round() / 10.0,
+        stability_score: (stability_final * 10.0).round() / 10.0,
+        expression_score: (expression_final * 10.0).round() / 10.0,
         total_score: (total_mapped * 10.0).round() / 10.0,
         dtw_cost: (dtw_cost * 100.0).round() / 100.0,
         passaggio_hz: passaggio.map(|p| (p * 10.0).round() / 10.0),
@@ -347,6 +441,7 @@ pub fn compute_singing_score(
             timestamps: p_ts,
             cent_diffs: p_diffs,
         }),
+        signal_quality: Some(quality),
     }
 }
 
@@ -428,8 +523,10 @@ mod tests {
             voicing: vec![true; n],
         };
         let result = score_singing(&ref_f0, &user_f0, None, None);
+        // Valid singing input still gets floor of 40
         assert!(result.total_score >= 40.0, "total={}", result.total_score);
         assert!(result.total_score <= 100.0, "total={}", result.total_score);
+        assert!(result.signal_quality.as_ref().unwrap().is_valid);
     }
 
     #[test]
@@ -444,7 +541,127 @@ mod tests {
         let result = score_singing(&f0, &f0, None, None);
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("pitch_score"));
+        assert!(json.contains("signal_quality"));
         let parsed: ScoringResult = serde_json::from_str(&json).unwrap();
         assert!((parsed.pitch_score - result.pitch_score).abs() < 1e-10);
+    }
+
+    /// Noise input: all frames unvoiced, zero confidence → score near 0
+    #[test]
+    fn test_noise_rejected() {
+        let n = 500;
+        let ref_f0 = F0Result {
+            timestamps: (0..n).map(|i| i as f64 * 0.01).collect(),
+            frequencies: vec![440.0; n],
+            confidences: vec![1.0; n],
+            voicing: vec![true; n],
+        };
+        // Simulate noise: F0 extractor marks everything unvoiced with zero confidence
+        let noise_f0 = F0Result {
+            timestamps: (0..n).map(|i| i as f64 * 0.01).collect(),
+            frequencies: vec![0.0; n],
+            confidences: vec![0.0; n],
+            voicing: vec![false; n],
+        };
+        let result = score_singing(&ref_f0, &noise_f0, None, None);
+        let q = result.signal_quality.as_ref().unwrap();
+        assert!(!q.is_valid, "Noise should fail quality gate");
+        assert!(q.voiced_ratio < 0.01, "voiced_ratio={}", q.voiced_ratio);
+        assert!(
+            result.total_score < 10.0,
+            "Noise total_score should be <10, got {}",
+            result.total_score
+        );
+    }
+
+    /// Sparse voicing with low confidence: simulates noisy F0 extraction
+    #[test]
+    fn test_sparse_low_confidence_rejected() {
+        let n = 500;
+        let ref_f0 = F0Result {
+            timestamps: (0..n).map(|i| i as f64 * 0.01).collect(),
+            frequencies: vec![440.0; n],
+            confidences: vec![1.0; n],
+            voicing: vec![true; n],
+        };
+        // 10% voiced, low confidence, random-ish pitches
+        let mut freqs = vec![0.0; n];
+        let mut voicing = vec![false; n];
+        let mut confidences = vec![0.05; n];
+        for i in (0..n).step_by(10) {
+            freqs[i] = 200.0 + (i as f64 * 37.0) % 600.0; // pseudo-random pitches
+            voicing[i] = true;
+            confidences[i] = 0.15;
+        }
+        let noisy_f0 = F0Result {
+            timestamps: (0..n).map(|i| i as f64 * 0.01).collect(),
+            frequencies: freqs,
+            confidences,
+            voicing,
+        };
+        let result = score_singing(&ref_f0, &noisy_f0, None, None);
+        let q = result.signal_quality.as_ref().unwrap();
+        assert!(!q.is_valid, "Sparse noisy F0 should fail quality gate");
+        assert!(
+            result.total_score < 20.0,
+            "Sparse noisy total should be <20, got {}",
+            result.total_score
+        );
+    }
+
+    /// Valid singing still scores well after the quality gate
+    #[test]
+    fn test_quality_gate_passes_real_singing() {
+        let n = 500;
+        let f0 = F0Result {
+            timestamps: (0..n).map(|i| i as f64 * 0.01).collect(),
+            frequencies: vec![440.0; n],
+            confidences: vec![0.9; n],
+            voicing: vec![true; n],
+        };
+        let result = score_singing(&f0, &f0, None, None);
+        let q = result.signal_quality.as_ref().unwrap();
+        assert!(q.is_valid, "Good singing should pass quality gate");
+        assert!(
+            q.quality_multiplier > 0.8,
+            "Good singing qm should be high, got {}",
+            q.quality_multiplier
+        );
+        assert!(
+            result.total_score > 70.0,
+            "Perfect match should score >70, got {}",
+            result.total_score
+        );
+    }
+
+    /// Quality assessment function directly
+    #[test]
+    fn test_assess_signal_quality_empty() {
+        let f0 = F0Result {
+            timestamps: vec![],
+            frequencies: vec![],
+            confidences: vec![],
+            voicing: vec![],
+        };
+        let q = assess_signal_quality(&f0);
+        assert!(!q.is_valid);
+        assert!(q.quality_multiplier < 0.001);
+    }
+
+    #[test]
+    fn test_assess_signal_quality_perfect() {
+        let n = 500;
+        let f0 = F0Result {
+            timestamps: (0..n).map(|i| i as f64 * 0.01).collect(),
+            frequencies: vec![440.0; n],
+            confidences: vec![0.95; n],
+            voicing: vec![true; n],
+        };
+        let q = assess_signal_quality(&f0);
+        assert!(q.is_valid);
+        assert!(q.voiced_ratio > 0.99);
+        assert!(q.mean_confidence > 0.9);
+        assert!(q.pitch_coherence > 0.99);
+        assert!(q.quality_multiplier > 0.95);
     }
 }
